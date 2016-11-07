@@ -19,70 +19,39 @@
 #import <UIKit/UIKit.h>
 #import "GCDAsyncUdpSocket.h"
 
-/*┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
-  │  NTP Timestamp Structure                                                                         │
-  │                                                                                                  │
-  │   0                   1                   2                   3                                  │
-  │   0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1                                │
-  │  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               │
-  │  |  Seconds                                                      |                               │
-  │  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               │
-  │  |  Seconds Fraction (0-padded)  |       |       |       |       | <-- 4294967296 = 1 second     │
-  │  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               │
-  │                  |               |       |   |   |               |                               │
-  │                  |               |       |   |   |              233 picoseconds                  │
-  │                  |               |       |   | 59.6 nanoseconds (mask = 0xffffff00)              │
-  │                  |               |       |  238 nanoseconds (mask = 0xfffffc00)                  │
-  │                  |               |      0.954 microsecond (mask = 0xfffff000)                    │
-  │                  |             15.3 microseconds (mask = 0xffff0000)                             │
-  │                 3.9 milliseconds (mask = 0xff000000)                                             │
-  │                                                                                                  │
-  │                                                                                                  │
-  └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
-
-#define JAN_1970    		((uint64_t)0x83aa7e80)          // UNIX epoch in NTP's epoch:
-                                                            // 1970-1900 (2,208,988,800s)
-union ntpTime {
-
-    struct {
-        uint32_t    fractSeconds;
-        uint32_t    wholeSeconds;
-    }           partials;
-
-    uint64_t    floating;
-
-} ;
-
-union ntpTime   ntp_time_now();
-union ntpTime   unix2ntp(const struct timeval * tv);
-double          ntpDiffSeconds(union ntpTime * start, union ntpTime * stop);
-
+@class NetAssociation;
 @protocol NetAssociationDelegate <NSObject>
 
-- (void) reportFromDelegate;
+- (void) netAssociationDidUpdateState:(NetAssociation *)sender;
 
 @end
 
-@protocol GCDAsyncUdpSocketDelegate;
 
-@interface NetAssociation : NSObject <GCDAsyncUdpSocketDelegate, NetAssociationDelegate>
+@interface NetAssociation : NSObject
 
-@property (nonatomic, weak) id delegate;
+@property (nonatomic, readonly) double    dispersion;         // milliSeconds
+@property (nonatomic, readonly) NSString *pool;               // ntp pool "0.pool.ntp.org"
+@property (nonatomic, readonly) NSString *serverIPAddress;    // server address "123.45.67.89"
+@property (nonatomic, readonly) BOOL      active;             // is this clock running yet?
+@property (nonatomic, readonly) BOOL      trusty;             // is this clock trustworthy
+@property (nonatomic, readonly) double    offset;             // offset from device time (secs)
 
-@property (readonly) NSString *         server;             // server address "123.45.67.89"
-@property (readonly) BOOL               active;             // is this clock running yet?
-@property (readonly) BOOL               trusty;             // is this clock trustworthy
-@property (readonly) double             offset;             // offset from device time (secs)
+/**
+ Used to trysty/unstrusty NTP server, typical values (0.001..-0.1) in S.
+ Default value is 0.025 S
+ */
+@property (nonatomic) double timeDeviationDrift;
+@property (nonatomic, weak) id<NetAssociationDelegate> delegate;
 
 - (instancetype) init NS_UNAVAILABLE;
 /*┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
   ┃ create a NetAssociation with the provided server name ..                                         ┃
   ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛*/
-- (instancetype) initWithServerName:(NSString *) serverName NS_DESIGNATED_INITIALIZER;
+
+- (instancetype) initWithServerPool:(NSString *)pool IPAddress:(NSString *) serverIPAddress NS_DESIGNATED_INITIALIZER;
 
 - (void) enable;
 - (void) finish;
 
-- (void) sendTimeQuery;                                     // send one datagram to server ..
-
 @end
+

@@ -11,14 +11,23 @@
   ┃ early estimate and then refine that and reduce the number of notifications ...                   ┃
   ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛*/
 
+typedef NS_ENUM(NSInteger, NetworkClockState) {
+    NetworkClockStateNotStarted,
+    NetworkClockStateStarting,
+    NetworkClockStateStarted,
+};
+
+
 @interface NetworkClock : NSObject
 
-+ (instancetype) sharedNetworkClock;
+@property (nullable, nonatomic, readonly, copy) NSDate *networkTime;
+@property (nonatomic, readonly) NSTimeInterval networkOffset;       // If not determained == INFINITY
+@property (nonatomic, readonly) NetworkClockState networkClockState;
 
-- (void) createAssociations;
-- (void) finishAssociations;
+@property (nullable, nonatomic, copy) void (^networkOffsetUpdated)(NSTimeInterval networkOffset);
 
-@property (NS_NONATOMIC_IOSONLY, readonly, copy) NSDate *   networkTime;
-@property (NS_NONATOMIC_IOSONLY, readonly) NSTimeInterval   networkOffset;
+- (void)startWithCompletion:(nonnull void(^)(BOOL success))completion;
+- (void)finish;
 
 @end
+ 
