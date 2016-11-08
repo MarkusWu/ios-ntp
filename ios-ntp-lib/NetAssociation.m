@@ -32,6 +32,8 @@
  │                                                                                                  │
  └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
 
+static const uint8_t kFifoQueueSize = 8;
+
 #define JAN_1970    		((uint64_t)0x83aa7e80)          // UNIX epoch in NTP's epoch:
 // 1970-1900 (2,208,988,800s)
 
@@ -116,7 +118,7 @@ double ntpDiffSeconds(union ntpTime * start, union ntpTime * stop) {
 
     int                     li, vn, mode, stratum, poll, prec, refid;
 
-    double                  fifoQueue[8];
+    double                  fifoQueue[kFifoQueueSize];
     short                   fifoIndex;
 
 }
@@ -248,7 +250,7 @@ double ntpDiffSeconds(union ntpTime * start, union ntpTime * stop) {
 }
 
 - (void)cleanupFIFOQueue {
-    for (short i = 0; i < 8; i++) fifoQueue[i] = NAN;      // set fifo to all empty
+    for (short i = 0; i < kFifoQueueSize; i++) fifoQueue[i] = NAN;      // set fifo to all empty
     fifoIndex = 0;
 }
 
@@ -392,11 +394,11 @@ double ntpDiffSeconds(union ntpTime * start, union ntpTime * stop) {
 
 - (void) handleNewOffset:(double)offset {
 /*┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
-  │ the packet is trustworthy -- compute and store offset in 8-slot fifo ...                         │
+  │ the packet is trustworthy -- compute and store offset in kFifoQueueSize-slot fifo ...                         │
   └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
 
-    fifoQueue[fifoIndex++ % 8] = offset;                            // store offset in seconds
-    fifoIndex %= 8;                                                 // rotate index in range
+    fifoQueue[fifoIndex++ % kFifoQueueSize] = offset;                            // store offset in seconds
+    fifoIndex %= kFifoQueueSize;                                                 // rotate index in range
 
 /*┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
   │ look at the (up to eight) offsets in the fifo and and count 'good', 'fail' and 'not used yet'    │
@@ -404,7 +406,7 @@ double ntpDiffSeconds(union ntpTime * start, union ntpTime * stop) {
     short good = 0, fail = 0, none = 0;
     double offsetSum = 0.0;                                     // reset for averaging
 
-    for (short i = 0; i < 8; i++) {
+    for (short i = 0; i < kFifoQueueSize; i++) {
         if (isnan(fifoQueue[i])) {                                  // fifo slot is unused
             none++;
             continue;
@@ -431,7 +433,7 @@ double ntpDiffSeconds(union ntpTime * start, union ntpTime * stop) {
         shouldNotify = YES;
         averageOffset = offsetSum / good;                     // average good times
 
-        for (short i = 0; i < 8; i++) {
+        for (short i = 0; i < kFifoQueueSize; i++) {
             if (isnan(fifoQueue[i])) continue;
 
             if (isinf(fifoQueue[i]) || fabs(fifoQueue[i]) < 0.001) continue;

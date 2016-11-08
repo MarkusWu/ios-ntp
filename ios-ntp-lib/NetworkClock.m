@@ -23,6 +23,7 @@
 
 @property (nonatomic, readwrite) NetworkClockState networkClockState;
 @property (nonatomic, readwrite) NSTimeInterval networkOffset;
+@property (nonatomic, strong, readonly) NSArray *defaultPoolList;
 
 @end
 
@@ -193,15 +194,7 @@
     NSArray *ntpDomains;
     NSString *filePath = [[NSBundle mainBundle] pathForResource:@"ntp.hosts" ofType:@""];
     if (nil == filePath) {
-        ntpDomains = @[@"0.pool.ntp.org",
-                       @"0.uk.pool.ntp.org",
-                       @"0.us.pool.ntp.org",
-                       @"asia.pool.ntp.org",
-                       @"europe.pool.ntp.org",
-                       @"north-america.pool.ntp.org",
-                       @"south-america.pool.ntp.org",
-                       @"oceania.pool.ntp.org",
-                       @"africa.pool.ntp.org"];
+        ntpDomains = self.defaultPoolList;
     } else {
         NSString *      fileData = [[NSString alloc] initWithData:[[NSFileManager defaultManager]
                                                                    contentsAtPath:filePath]
@@ -211,6 +204,23 @@
     }
     
     return ntpDomains;
+}
+
+- (NSArray *)defaultPoolList {
+    static NSArray *defaultPoolList;
+    if (defaultPoolList == nil) {
+        defaultPoolList = @[@"0.pool.ntp.org",
+                            @"0.uk.pool.ntp.org",
+                            @"0.us.pool.ntp.org",
+                            @"asia.pool.ntp.org",
+                            @"europe.pool.ntp.org",
+                            @"north-america.pool.ntp.org",
+                            @"south-america.pool.ntp.org",
+                            @"oceania.pool.ntp.org",
+                            @"africa.pool.ntp.org"];
+    }
+    
+    return defaultPoolList;
 }
 
 #pragma mark - NetAssosiation Delegate
