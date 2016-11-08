@@ -10,15 +10,20 @@
 #import "ntp-log.h"
 #import "GCDAsyncUdpSocket.h"
 
-@interface NetworkClock () {
-
+@interface NetworkClock () <NetAssociationDelegate> {
+    
+    NSDate *                poolIPAddressesRefreshDate;
+    NSDictionary *          poolIPAddresses;
     NSMutableArray *        timeAssociations;
     NSArray *               sortDescriptors;
 
     NSSortDescriptor *      dispersionSortDescriptor;
-    dispatch_queue_t        associationDelegateQueue;
 
 }
+
+@property (nonatomic, readwrite) NetworkClockState networkClockState;
+@property (nonatomic, readwrite) NSTimeInterval networkOffset;
+@property (nonatomic, strong, readonly) NSArray *defaultPoolList;
 
 @end
 
@@ -34,54 +39,19 @@
 
 @implementation NetworkClock
 
-+ (instancetype) sharedNetworkClock {
-    static id               sharedNetworkClockInstance = nil;
-    static dispatch_once_t  onceToken;
 
-    dispatch_once(&onceToken, ^{
-        sharedNetworkClockInstance = [[self alloc] init];
-    });
-
-    return sharedNetworkClockInstance;
-}
-
-/*┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-  ┃ Return the offset to network-derived UTC.                                                        ┃
-  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛*/
-- (NSTimeInterval) networkOffset {
-
-    if ([timeAssociations count] == 0) return 0.0;
-
-    NSArray *       sortedArray = [timeAssociations sortedArrayUsingDescriptors:sortDescriptors];
-
-    double          timeInterval = 0.0;
-    short           usefulCount = 0;
-
-    for (NetAssociation * timeAssociation in sortedArray) {
-        if (timeAssociation.active) {
-            if (timeAssociation.trusty) {
-                usefulCount++;
-                timeInterval = timeInterval + timeAssociation.offset;
-//              NSLog(@"[%@]: %f (%d)", timeAssociation.server, timeAssociation.offset*1000.0, usefulCount);
-            }
-            else {
-                NSLog(@"Clock•Drop: [%@]", timeAssociation.server);
-                if ([timeAssociations count] > 8) {
-                    [timeAssociations removeObject:timeAssociation];
-                    [timeAssociation finish];
-                }
-            }
-
-            if (usefulCount == 8) break;                // use 8 best dispersions
-        }
+- (instancetype) init {
+    if (self = [super init]) {
+        /*┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
+          │ Prepare a sort-descriptor to sort associations based on their dispersion, and then create an     │
+          │ array of empty associations to use ...                                                           │
+          └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
+        sortDescriptors = @[[[NSSortDescriptor alloc] initWithKey:@"dispersion" ascending:YES]];
+        timeAssociations = [NSMutableArray arrayWithCapacity:100];
+        self.networkOffset = INFINITY;
     }
-
-    if (usefulCount > 0) {
-        timeInterval = timeInterval / usefulCount;
-//      NSLog(@"timeIntervalSinceDeviceTime: %f (%d)", timeInterval*1000.0, usefulCount);
-    }
-
-    return timeInterval;
+    
+    return self;
 }
 
 /*┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
@@ -91,128 +61,209 @@
     return [[NSDate date] dateByAddingTimeInterval:-[self networkOffset]];
 }
 
-- (instancetype) init {
-    if (self = [super init]) {
-/*┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
-  │ Prepare a sort-descriptor to sort associations based on their dispersion, and then create an     │
-  │ array of empty associations to use ...                                                           │
-  └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
-        sortDescriptors = @[[[NSSortDescriptor alloc] initWithKey:@"dispersion" ascending:YES]];
-        timeAssociations = [NSMutableArray arrayWithCapacity:100];
-/*┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
-  │ .. and fill that array with the time hosts obtained from "ntp.hosts" ..                          │
-  └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
-        [[[NSOperationQueue alloc] init] addOperation:[[NSInvocationOperation alloc]
-                                                      initWithTarget:self
-                                                            selector:@selector(createAssociations)
-                                                              object:nil]];
-    }
-
-    return self;
-}
-
 /*┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
   ┃ Use the following time servers or, if it exists, read the "ntp.hosts" file from the application  ┃
   ┃ resources and derive all the IP addresses referred to, remove any duplicates and create an       ┃
   ┃ 'association' (individual host client) for each one.                                             ┃
   ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛*/
-- (void) createAssociations {
-    NSArray *           ntpDomains;
-    NSString *          filePath = [[NSBundle mainBundle] pathForResource:@"ntp.hosts" ofType:@""];
-    if (nil == filePath) {
-        ntpDomains = @[@"0.pool.ntp.org",
-                       @"0.uk.pool.ntp.org",
-                       @"0.us.pool.ntp.org",
-                       @"asia.pool.ntp.org",
-                       @"europe.pool.ntp.org",
-                       @"north-america.pool.ntp.org",
-                       @"south-america.pool.ntp.org",
-                       @"oceania.pool.ntp.org",
-                       @"africa.pool.ntp.org"];
+- (void)startWithCompletion:(nonnull void(^)(BOOL success))completion {
+    if (self.networkClockState == NetworkClockStateStarting) {
+        completion(NO);
+        return;
     }
-    else {
-        NSString *      fileData = [[NSString alloc] initWithData:[[NSFileManager defaultManager]
-                                                                   contentsAtPath:filePath]
-                                                         encoding:NSUTF8StringEncoding];
-
-        ntpDomains = [fileData componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
+    
+    if (timeAssociations.count || self.networkClockState == NetworkClockStateStarted) {
+        completion(YES);
+        return;
     }
-
-/*┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
-  │  for each NTP service domain name in the 'ntp.hosts' file : "0.pool.ntp.org" etc ...             │
-  └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
-    NSMutableSet *      hostAddresses = [NSMutableSet setWithCapacity:100];
-
-    for (NSString * ntpDomainName in ntpDomains) {
-        if ([ntpDomainName length] == 0 ||
-            [ntpDomainName characterAtIndex:0] == ' ' ||
-            [ntpDomainName characterAtIndex:0] == '#') {
-            continue;
+    
+    self.networkClockState = NetworkClockStateStarting;
+    
+    // IP addresses must be refreshed every 1 hour as they updated in pools
+    if (poolIPAddressesRefreshDate) {
+        NSTimeInterval timeSinceLastRefresh = [[NSDate date] timeIntervalSinceDate:poolIPAddressesRefreshDate];
+        if (timeSinceLastRefresh >= 60 * 60) { // 1 hour
+            poolIPAddressesRefreshDate = nil;
+            poolIPAddresses = nil;
         }
-
-/*┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
-  │  ... resolve the IP address of the named host : "0.pool.ntp.org" --> [123.45.67.89], ...         │
-  └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
-        CFHostRef ntpHostName = CFHostCreateWithName (nil, (__bridge CFStringRef)ntpDomainName);
-        if (nil == ntpHostName) {
-            NTP_Logging(@"CFHostCreateWithName <nil> for %@", ntpDomainName);
-            continue;                                           // couldn't create 'host object' ...
-        }
-
-        CFStreamError   nameError;
-        if (!CFHostStartInfoResolution (ntpHostName, kCFHostAddresses, &nameError)) {
-            NTP_Logging(@"CFHostStartInfoResolution error %i for %@", (int)nameError.error, ntpDomainName);
-            CFRelease(ntpHostName);
-            continue;                                           // couldn't start resolution ...
-        }
-
-        Boolean         nameFound;
-        CFArrayRef      ntpHostAddrs = CFHostGetAddressing (ntpHostName, &nameFound);
-
-        if (!nameFound) {
-            NTP_Logging(@"CFHostGetAddressing: %@ NOT resolved", ntpHostName);
-            CFRelease(ntpHostName);
-            continue;                                           // resolution failed ...
-        }
-
-        if (ntpHostAddrs == nil) {
-            NTP_Logging(@"CFHostGetAddressing: no addresses resolved for %@", ntpHostName);
-            CFRelease(ntpHostName);
-            continue;                                           // NO addresses were resolved ...
-        }
-/*┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
-  │  for each (sockaddr structure wrapped by a CFDataRef/NSData *) associated with the hostname,     │
-  │  drop the IP address string into a Set to remove duplicates.                                     │
-  └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
-        for (NSData * ntpHost in (__bridge NSArray *)ntpHostAddrs) {
-            [hostAddresses addObject:[GCDAsyncUdpSocket hostFromAddress:ntpHost]];
-        }
-
-        CFRelease(ntpHostName);
     }
-
-    NTP_Logging(@"%@", hostAddresses);                          // all the addresses resolved
-
-/*┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
-  │  ... now start one 'association' (network clock server) for each address.                        │
-  └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
-    for (NSString * server in hostAddresses) {
-        NetAssociation *    timeAssociation = [[NetAssociation alloc] initWithServerName:server];
-
-        [timeAssociations addObject:timeAssociation];
-        [timeAssociation enable];                               // starts are randomized internally
+    
+    if (poolIPAddresses) {
+        [self createNetAssosiationsWithIPAddresses:poolIPAddresses];
+        self.networkClockState = NetworkClockStateStarted;
+        completion(YES);
+    } else {
+        [self resolveHosts:[self pools] withCompletion:^(NSDictionary *IPAddresses) {
+            if (IPAddresses.count) {
+                poolIPAddressesRefreshDate = [NSDate date];
+                poolIPAddresses = IPAddresses;
+                [self createNetAssosiationsWithIPAddresses:poolIPAddresses];
+                self.networkClockState = NetworkClockStateStarted;
+                completion(YES);
+            } else {
+                self.networkClockState = NetworkClockStateNotStarted;
+                completion(NO);
+            }
+        }];
     }
 }
 
 /*┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
   ┃ Stop all the individual ntp clients associations ..                                              ┃
   ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛*/
-- (void) finishAssociations {
-    for (NetAssociation * timeAssociation in timeAssociations) [timeAssociation finish];
-    [[NSNotificationCenter defaultCenter] removeObserver:self];
+- (void) finish {
+    [timeAssociations makeObjectsPerformSelector:@selector(finish)];
+    [timeAssociations removeAllObjects];
+    self.networkClockState = NetworkClockStateNotStarted;
 }
 
-#pragma mark -
-#pragma mark                        I n t e r n a l  •  M e t h o d s
+#pragma mark - Private methods
+
+- (void)createNetAssosiationsWithIPAddresses:(NSDictionary *)IPAddresses
+{
+    for (NSString *IPAddress in IPAddresses) {
+        NetAssociation *timeAssociation = [[NetAssociation alloc] initWithServerPool:IPAddresses[IPAddress] IPAddress:IPAddress];
+        timeAssociation.delegate = self;
+        [timeAssociations addObject:timeAssociation];
+        [timeAssociation enable];                               // starts are randomized internally
+    }
+}
+
+- (void) resolveHosts:(NSArray<NSString*>*)hosts withCompletion:(void(^)(NSDictionary *IPAddresses))completion{
+    NSMutableDictionary *hostAddresses = [NSMutableDictionary dictionaryWithCapacity:100];
+    
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
+        for (NSString * ntpDomainName in hosts) {
+            if ([ntpDomainName length] == 0 ||
+                [ntpDomainName characterAtIndex:0] == ' ' ||
+                [ntpDomainName characterAtIndex:0] == '#') {
+                continue;
+            }
+            
+            /*┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
+              │  ... resolve the IP address of the named host : "0.pool.ntp.org" --> [123.45.67.89], ...         │
+              └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
+            CFHostRef ntpHostName = CFHostCreateWithName (nil, (__bridge CFStringRef)ntpDomainName);
+            if (nil == ntpHostName) {
+                NTP_Logging(@"CFHostCreateWithName <nil> for %@", ntpDomainName);
+                continue;                                           // couldn't create 'host object' ...
+            }
+            
+            CFStreamError   nameError;
+            if (!CFHostStartInfoResolution (ntpHostName, kCFHostAddresses, &nameError)) {
+                NTP_Logging(@"CFHostStartInfoResolution error %i for %@", (int)nameError.error, ntpDomainName);
+                CFRelease(ntpHostName);
+                continue;                                           // couldn't start resolution ...
+            }
+            
+            Boolean         nameFound;
+            CFArrayRef      ntpHostAddrs = CFHostGetAddressing (ntpHostName, &nameFound);
+            
+            if (!nameFound) {
+                NTP_Logging(@"CFHostGetAddressing: %@ NOT resolved", ntpHostName);
+                CFRelease(ntpHostName);
+                continue;                                           // resolution failed ...
+            }
+            
+            if (ntpHostAddrs == nil) {
+                NTP_Logging(@"CFHostGetAddressing: no addresses resolved for %@", ntpHostName);
+                CFRelease(ntpHostName);
+                continue;                                           // NO addresses were resolved ...
+            }
+            /*┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
+              │  for each (sockaddr structure wrapped by a CFDataRef/NSData *) associated with the hostname,     │
+              │  drop the IP address string into a Set to remove duplicates.                                     │
+              └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
+            for (NSData * ntpHost in (__bridge NSArray *)ntpHostAddrs) {
+                NSString *IPAddress = [GCDAsyncUdpSocket hostFromAddress:ntpHost];
+                hostAddresses[IPAddress] = ntpDomainName;
+            }
+            
+            CFRelease(ntpHostName);
+        }
+        
+        if (completion) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                completion(hostAddresses);
+            });
+        }
+    });
+}
+
+- (NSArray<NSString*> *) pools {
+    NSArray *ntpDomains;
+    NSString *filePath = [[NSBundle mainBundle] pathForResource:@"ntp.hosts" ofType:@""];
+    if (nil == filePath) {
+        ntpDomains = self.defaultPoolList;
+    } else {
+        NSString *      fileData = [[NSString alloc] initWithData:[[NSFileManager defaultManager]
+                                                                   contentsAtPath:filePath]
+                                                         encoding:NSUTF8StringEncoding];
+        
+        ntpDomains = [fileData componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
+    }
+    
+    return ntpDomains;
+}
+
+- (NSArray *)defaultPoolList {
+    static NSArray *defaultPoolList;
+    if (defaultPoolList == nil) {
+        defaultPoolList = @[@"0.pool.ntp.org",
+                            @"0.uk.pool.ntp.org",
+                            @"0.us.pool.ntp.org",
+                            @"asia.pool.ntp.org",
+                            @"europe.pool.ntp.org",
+                            @"north-america.pool.ntp.org",
+                            @"south-america.pool.ntp.org",
+                            @"oceania.pool.ntp.org",
+                            @"africa.pool.ntp.org"];
+    }
+    
+    return defaultPoolList;
+}
+
+#pragma mark - NetAssosiation Delegate
+
+- (void)netAssociationDidUpdateState:(NetAssociation *)sender {
+    NSTimeInterval newOffset = INFINITY;
+    NSTimeInterval oldValue = self.networkOffset;
+    
+    if ([timeAssociations count] > 0) {
+        NSArray *sortedArray = [timeAssociations sortedArrayUsingDescriptors:sortDescriptors];
+        
+        double timeInterval = 0.0;
+        short usefulCount = 0;
+
+        for (NetAssociation * timeAssociation in sortedArray) {
+            if (timeAssociation.active) {
+                if (timeAssociation.trusty) {
+                    usefulCount++;
+                    timeInterval = timeInterval + timeAssociation.offset;
+                } else {
+                    if ([timeAssociations count] > 8) {
+                        //NSLog(@"Clock•Drop: [%@]", timeAssociation.serverIPAddress);
+                        timeAssociation.delegate = nil;
+                        [timeAssociation finish];
+                        [timeAssociations removeObject:timeAssociation];
+                    }
+                }
+                
+                if (usefulCount == 8) break;                // use 8 best dispersions
+            }
+        }
+        
+        if (usefulCount > 0) {
+            newOffset = timeInterval / usefulCount;
+        }
+    }
+    
+    if (oldValue != newOffset) {
+        self.networkOffset = newOffset;
+        if (self.networkOffsetUpdated) {
+            self.networkOffsetUpdated(newOffset);
+        }
+    }
+}
 
 @end

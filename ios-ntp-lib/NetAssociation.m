@@ -9,6 +9,46 @@
 
 #import <sys/time.h>
 
+
+
+/*┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
+ │  NTP Timestamp Structure                                                                         │
+ │                                                                                                  │
+ │   0                   1                   2                   3                                  │
+ │   0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1                                │
+ │  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               │
+ │  |  Seconds                                                      |                               │
+ │  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               │
+ │  |  Seconds Fraction (0-padded)  |       |       |       |       | <-- 4294967296 = 1 second     │
+ │  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               │
+ │                  |               |       |   |   |               |                               │
+ │                  |               |       |   |   |              233 picoseconds                  │
+ │                  |               |       |   | 59.6 nanoseconds (mask = 0xffffff00)              │
+ │                  |               |       |  238 nanoseconds (mask = 0xfffffc00)                  │
+ │                  |               |      0.954 microsecond (mask = 0xfffff000)                    │
+ │                  |             15.3 microseconds (mask = 0xffff0000)                             │
+ │                 3.9 milliseconds (mask = 0xff000000)                                             │
+ │                                                                                                  │
+ │                                                                                                  │
+ └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
+
+static const uint8_t kFifoQueueSize = 8;
+
+#define JAN_1970    		((uint64_t)0x83aa7e80)          // UNIX epoch in NTP's epoch:
+// 1970-1900 (2,208,988,800s)
+
+union ntpTime {
+    
+    struct {
+        uint32_t    fractSeconds;
+        uint32_t    wholeSeconds;
+    }           partials;
+    
+    uint64_t    floating;
+    
+} ;
+
+
 #pragma -
 #pragma mark                        T i m e • C o n v e r t e r s
 
@@ -20,15 +60,6 @@ static double pollIntervals[18] = {
 };
 
 /*┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
-  │ get current time in NTP format                                                                   │
-  └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
-union ntpTime ntp_time_now() {
-    struct timeval      now;
-    gettimeofday(&now, (struct timezone *)NULL);
-    return unix2ntp(&now);
-}
-
-/*┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
   │ Convert from Unix time to NTP time                                                               │
   │     (on MacOSX clock resolution is 1μS, so ntp's ~12 low bits are meaningless)                   │
   └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
@@ -38,6 +69,15 @@ union ntpTime unix2ntp(const struct timeval * tv) {
     ntp1.partials.wholeSeconds = (uint32_t)(tv->tv_sec + JAN_1970);
     ntp1.partials.fractSeconds = (uint32_t)((double)tv->tv_usec * (1LL<<32) * 1.0e-6);
     return ntp1;
+}
+
+/*┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │ get current time in NTP format                                                                   │
+  └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
+union ntpTime ntp_time_now() {
+    struct timeval      now;
+    gettimeofday(&now, (struct timezone *)NULL);
+    return unix2ntp(&now);
 }
 
 /*┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
@@ -55,20 +95,21 @@ double ntpDiffSeconds(union ntpTime * start, union ntpTime * stop) {
         b = ~b;
         a -= 1;
     }
-
+    
     return a + b / 4294967296.0;
 }
 
 /*┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
   ┃ NetAssociation: Private Variables                                                                ┃
   ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛*/
-@interface NetAssociation () {
+@interface NetAssociation () <GCDAsyncUdpSocketDelegate> {
 
     GCDAsyncUdpSocket *     socket;                         // NetAssociation UDP Socket
 
-    NSTimer *               repeatingTimer;                 // fires off an ntp request ...
+    dispatch_queue_t        workingQueue;
+    NSTimer *               queryTimer;                     // fires off an ntp request ...
     int                     pollingIntervalIndex;           // index into polling interval table
-
+    
     union ntpTime           ntpClientSendTime,
                             ntpServerRecvTime,
                             ntpServerSendTime,
@@ -77,15 +118,12 @@ double ntpDiffSeconds(union ntpTime * start, union ntpTime * stop) {
 
     int                     li, vn, mode, stratum, poll, prec, refid;
 
-    double                  timerWobbleFactor;              // 0.75 .. 1.25
-
-    double                  fifoQueue[8];
+    double                  fifoQueue[kFifoQueueSize];
     short                   fifoIndex;
 
 }
 
 @property (readonly) double root_delay;                     // milliSeconds
-@property (readonly) double dispersion;                     // milliSeconds
 @property (readonly) double roundtrip;                      // seconds
 @property (readonly) double serverDelay;                    // seconds
 
@@ -100,32 +138,33 @@ double ntpDiffSeconds(union ntpTime * start, union ntpTime * stop) {
   ┃ Initialize the association with a blank socket and prepare the time transaction to happen every  ┃
   ┃ 16 seconds (initial value) ...                                                                   ┃
   ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛*/
-- (instancetype) initWithServerName:(NSString *) serverName {
+- (instancetype) initWithServerPool:(NSString *)pool IPAddress:(NSString *) serverIPAddress {
     if (self = [super init]) {
 /*┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
   │ Set initial/default values for instance variables ...                                            │
   └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
-        _delegate = self;
         pollingIntervalIndex = 0;                           // ensure the first timer firing is soon
         _active = FALSE;                                    // isn't running till it reports time ...
         _trusty = FALSE;                                    // don't trust this clock to start with ...
         _offset = INFINITY;                                 // start with net clock meaningless
-        _server = serverName;
-
+        _serverIPAddress = [serverIPAddress copy];
+        _pool = pool;
+        _timeDeviationDrift = 0.025;
+        
 /*┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
   │ Create a UDP socket that will communicate with the time server and set its delegate ...          │
   └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
-        socket = [[GCDAsyncUdpSocket alloc] initWithDelegate:self
-                                               delegateQueue:dispatch_queue_create(
-                   [serverName cStringUsingEncoding:NSUTF8StringEncoding], DISPATCH_QUEUE_SERIAL)];
-
-		[self registerObservations];
+        workingQueue = dispatch_queue_create([_serverIPAddress cStringUsingEncoding:NSUTF8StringEncoding], DISPATCH_QUEUE_SERIAL);
+        socket = [[GCDAsyncUdpSocket alloc] initWithDelegate:self delegateQueue:workingQueue];
     }
-//  NSLog(@"Assoc•Init: [%@]", serverName);
 
     return self;
 }
 
+- (void)dealloc {
+    socket.delegate = nil;
+    [socket close];
+}
 
 /*┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
   ┃ This sets the association in a mode where it repeatedly gets time from its server and performs   ┃
@@ -133,32 +172,11 @@ double ntpDiffSeconds(union ntpTime * start, union ntpTime * stop) {
   ┃ starts the timer firing (sets the fire time randonly within the next five seconds) ...           ┃
   ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛*/
 - (void) enable {
-
-/*┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
-  │ Create a first-in/first-out queue for time samples.  As we compute each new time obtained from   │
-  │ the server we push it into the fifo.  We sample the contents of the fifo for quality and, if it  │
-  │ meets our standards we use the contents of the fifo to obtain a weighted average of the times.   │
-  └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
-    for (short i = 0; i < 8; i++) fifoQueue[i] = NAN;   // set fifo to all empty
-    fifoIndex = 0;
-
-/*┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
-  │ Finally, initialize the repeating timer that queries the server, set it's trigger time to the    │
-  │ infinite future, and put it on the run loop .. nothing will happen (yet)                         │
-  └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
-    repeatingTimer = [NSTimer timerWithTimeInterval:MAXFLOAT
-                                             target:self selector:@selector(queryTimeServer)
-                                           userInfo:nil repeats:YES];
-    repeatingTimer.tolerance = 1.0;                     // it can be up to 1 second late
-    [[NSRunLoop mainRunLoop] addTimer:repeatingTimer forMode:NSDefaultRunLoopMode];
-
-/*┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
-  │ now start the timer .. fire the first one soon, and put some wobble in its timing so we don't    │
-  │ get pulses of activity.                                                                          │
-  └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
-    timerWobbleFactor = ((float)rand()/(float)RAND_MAX / 2.0) + 0.75;       // 0.75 .. 1.25
-    NSTimeInterval  interval = pollIntervals[pollingIntervalIndex] * timerWobbleFactor;
-    [repeatingTimer setFireDate:[NSDate dateWithTimeIntervalSinceNow:interval]];
+    dispatch_async(workingQueue, ^{
+        [self cleanupFIFOQueue];
+    });
+    
+    [self startQueryTimer];
 
     pollingIntervalIndex = 4;                           // subsequent timers fire at default intervals
 }
@@ -167,41 +185,82 @@ double ntpDiffSeconds(union ntpTime * start, union ntpTime * stop) {
   ┃ Set the receiver and send the time query with 2 second timeout, ...                              ┃
   ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛*/
 - (void) queryTimeServer {
-    [self sendTimeQuery];
+    __weak typeof(self) weakSelf = self;
+    
+    [queryTimer invalidate];
+    queryTimer = nil;
+    
+    dispatch_async(dispatch_get_main_queue(), ^{
+        __strong typeof(self) strongSelf = weakSelf;
+        if (strongSelf) {
+            [strongSelf sendTimeQuery];
+            [strongSelf startQueryTimer];
+        }
+    });
+}
 
 /*┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
   │ Put some wobble into the repeating time so they don't synchronize and thump the network          │
   └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
-    timerWobbleFactor = ((float)rand()/(float)RAND_MAX / 2.0) + 0.75;       // 0.75 .. 1.25
-    NSTimeInterval  interval = pollIntervals[pollingIntervalIndex] * timerWobbleFactor;
-    [repeatingTimer setFireDate:[NSDate dateWithTimeIntervalSinceNow:interval]];
+- (void)startQueryTimer {
+    NSTimeInterval timerWobbleFactor = ((float)rand()/(float)RAND_MAX / 2.0) + 0.75;       // 0.75 .. 1.25
+    NSTimeInterval interval = pollIntervals[pollingIntervalIndex] * timerWobbleFactor;
+    
+    queryTimer = [NSTimer scheduledTimerWithTimeInterval:interval
+                                                  target:self
+                                                selector:@selector(queryTimeServer)
+                                                userInfo:nil
+                                                 repeats:NO];
+                  
+    queryTimer.tolerance = 1.0;                     // it can be up to 1 second late
 }
 
 /*┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
   ┃                                                                 ...                              ┃
   ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛*/
 - (void) sendTimeQuery {
-    NSError *   error = nil;
-
-    [socket sendData:[self createPacket] toHost:_server port:123 withTimeout:2.0 tag:0];
-
-    if(![socket beginReceiving:&error]) {
-        NTP_Logging(@"Unable to start listening on socket for [%@] due to error [%@]", _server, error);
-        return;
-    }
+    dispatch_async(workingQueue, ^{
+        NSError *   error = nil;
+        
+        [socket sendData:[self createPacket] toHost:_serverIPAddress port:123 withTimeout:2.0 tag:0];
+        
+        if(![socket beginReceiving:&error]) {
+            NTP_Logging(@"Unable to start listening on socket for [%@] due to error [%@]", _serverIPAddress, error);
+            return;
+        }
+    });
 }
 
 /*┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
   ┃ This stops the timer firing (sets the fire time to the infinite future) ...                      ┃
   ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛*/
 - (void) finish {
-    [repeatingTimer setFireDate:[NSDate distantFuture]];
-
-    for (short i = 0; i < 8; i++) fifoQueue[i] = NAN;      // set fifo to all empty
-    fifoIndex = 0;
-
-    _active = FALSE;
+    dispatch_sync(workingQueue, ^{
+        [socket close];
+        
+        [self cleanupFIFOQueue];
+        
+        _active = FALSE;
+        _trusty = FALSE;
+        _offset = INFINITY;
+    });
+    
+    [queryTimer invalidate];
+    queryTimer = nil;
 }
+
+- (void)cleanupFIFOQueue {
+    for (short i = 0; i < kFifoQueueSize; i++) fifoQueue[i] = NAN;      // set fifo to all empty
+    fifoIndex = 0;
+}
+
+/*┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+  ┃ Make an NSDate from ntpTimestamp ... (via seconds from JAN_1970) ...                             ┃
+  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛*/
+- (NSDate *) dateFromNetworkTime:(union ntpTime *) networkTime {
+    return [NSDate dateWithTimeIntervalSince1970:ntpDiffSeconds(&NTP_1970, networkTime)];
+}
+
 
 #pragma mark                        N e t w o r k • T r a n s a c t i o n s
 
@@ -260,11 +319,6 @@ double ntpDiffSeconds(union ntpTime * start, union ntpTime * stop) {
 }
 
 - (void) decodePacket:(NSData *) data {
-/*┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
-  │  grab the packet arrival time as fast as possible, before computations below ...                 │
-  └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
-    ntpClientRecvTime = ntp_time_now();
-
     uint32_t        wireData[12];
     [data getBytes:wireData length:48];
 
@@ -310,13 +364,13 @@ double ntpDiffSeconds(union ntpTime * start, union ntpTime * stop) {
   │ .. if max_error is less than 50mS (and not zero) AND                                             │
   │ .. stratum > 0 AND                                                                               │
   │ .. the mode is 4 (packet came from server) AND                                                   │
-  │ .. the server clock was set less than 1 minute ago                                               │
+  │ .. the server clock was set less than 1 hour ago                                                 │
   └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
-    _offset = INFINITY;                                                 // clock meaningless
+    double offset = INFINITY;                                                 // clock meaningless
     if ((_dispersion < 50.0 && _dispersion > 0.00001) &&
         (stratum > 0) && (mode == 4) &&
-        (ntpDiffSeconds(&ntpServerBaseTime, &ntpServerSendTime) < 60.0)) {
-
+        (ntpDiffSeconds(&ntpServerBaseTime, &ntpServerSendTime) < 3600.0))
+    {
         double  t41 = ntpDiffSeconds(&ntpClientSendTime, &ntpClientRecvTime);   // .. (T4-T1)
         double  t32 = ntpDiffSeconds(&ntpServerRecvTime, &ntpServerSendTime);   // .. (T3-T2)
 
@@ -325,32 +379,34 @@ double ntpDiffSeconds(union ntpTime * start, union ntpTime * stop) {
         double  t21 = ntpDiffSeconds(&ntpServerSendTime, &ntpClientRecvTime);   // .. (T2-T1)
         double  t34 = ntpDiffSeconds(&ntpServerRecvTime, &ntpClientSendTime);   // .. (T3-T4)
 
-        _offset = (t21 + t34) / 2.0;                                            // calculate offset
+        offset = (t21 + t34) / 2.0;                                     // calculate offset
 
 //      NSLog(@"t21=%.6f t34=%.6f delta=%.6f offset=%.6f", t21, t34, _roundtrip, _offset);
         _active = TRUE;
 
-//      NTP_Logging(@"%@", [self prettyPrintTimers]);
+//      NTP_Logging(@"%@", [self prettyPrintTimersWithOffset:offset]);
+    } else {
+        //NSLog(@"PACKET FAIL %@", _serverIPAddress);
     }
-
-    [_delegate reportFromDelegate];                                 // tell delegate we're done
+    
+    [self handleNewOffset:offset];
 }
 
-- (void) reportFromDelegate {
+- (void) handleNewOffset:(double)offset {
 /*┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
-  │ the packet is trustworthy -- compute and store offset in 8-slot fifo ...                         │
+  │ the packet is trustworthy -- compute and store offset in kFifoQueueSize-slot fifo ...                         │
   └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
 
-    fifoQueue[fifoIndex++ % 8] = _offset;                           // store offset in seconds
-    fifoIndex %= 8;                                                 // rotate index in range
+    fifoQueue[fifoIndex++ % kFifoQueueSize] = offset;                            // store offset in seconds
+    fifoIndex %= kFifoQueueSize;                                                 // rotate index in range
 
 /*┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
   │ look at the (up to eight) offsets in the fifo and and count 'good', 'fail' and 'not used yet'    │
   └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
-    short           good = 0, fail = 0, none = 0;
-    _offset = 0.0;                                                  // reset for averaging
+    short good = 0, fail = 0, none = 0;
+    double offsetSum = 0.0;                                     // reset for averaging
 
-    for (short i = 0; i < 8; i++) {
+    for (short i = 0; i < kFifoQueueSize; i++) {
         if (isnan(fifoQueue[i])) {                                  // fifo slot is unused
             none++;
             continue;
@@ -361,7 +417,7 @@ double ntpDiffSeconds(union ntpTime * start, union ntpTime * stop) {
         }
 
         good++;
-        _offset += fifoQueue[i];                                    // accumulate good times
+        offsetSum += fifoQueue[i];                             // accumulate good times
     }
 
 /*┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
@@ -369,26 +425,30 @@ double ntpDiffSeconds(union ntpTime * start, union ntpTime * stop) {
   │      inform our management accordingly.  If we have less than four 'fails' we won't make any     │
   │      note of that ... we won't condemn a server until we get four 'fail' packets.                │
   └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
-    double	stdDev = 0.0;
+    double averageOffset = _offset;
+    double stdDev = 0.0;
+    BOOL shouldNotify = NO;
+    
     if (good > 0 || fail > 3) {
-        _offset = _offset / good;                                   // average good times
+        shouldNotify = YES;
+        averageOffset = offsetSum / good;                     // average good times
 
-        for (short i = 0; i < 8; i++) {
+        for (short i = 0; i < kFifoQueueSize; i++) {
             if (isnan(fifoQueue[i])) continue;
 
             if (isinf(fifoQueue[i]) || fabs(fifoQueue[i]) < 0.001) continue;
 
-            stdDev += (fifoQueue[i] - _offset) * (fifoQueue[i] - _offset);
+            stdDev += pow(fifoQueue[i] - averageOffset, 2.0);
         }
         stdDev = sqrt(stdDev/(float)good);
-
+            
         _trusty = (good+none > 4) &&                                // four or more 'fails'
-                  (fabs(_offset) > stdDev*3.0);                     // s.d. < offset
+                  (stdDev <= _timeDeviationDrift);                  // s.d. <= Deviation Drift
 
-        NTP_Logging(@"  [%@] {%3.1f,%3.1f,%3.1f,%3.1f,%3.1f,%3.1f,%3.1f,%3.1f} ↑=%i, ↓=%i, %3.1f(%3.1f) %@", _server,
+        NTP_Logging(@"  [%@:%@] {%3.1f,%3.1f,%3.1f,%3.1f,%3.1f,%3.1f,%3.1f,%3.1f} ↑=%i, ↓=%i, %3.1f(%3.1f) %@", _pool, _serverIPAddress,
                     fifoQueue[0]*1000.0, fifoQueue[1]*1000.0, fifoQueue[2]*1000.0, fifoQueue[3]*1000.0,
                     fifoQueue[4]*1000.0, fifoQueue[5]*1000.0, fifoQueue[6]*1000.0, fifoQueue[7]*1000.0,
-                    good, fail, _offset*1000.0, stdDev*1000.0, _trusty ? @"↑" : @"↓");
+                    good, fail, averageOffset*1000.0, stdDev*1000.0, _trusty ? @"↑" : @"↓");
 
     }
 
@@ -399,8 +459,16 @@ double ntpDiffSeconds(union ntpTime * start, union ntpTime * stop) {
   │      stratum=1 servers, it would be a Good Thing to not hammer those so hard ...                 │
   └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
     if ((stratum == 1 && pollingIntervalIndex != 6) ||
-        (stratum == 2 && pollingIntervalIndex != 5)) {
+        (stratum == 2 && pollingIntervalIndex != 5))
+    {
         pollingIntervalIndex = 7 - stratum;
+    }
+    
+    if (shouldNotify && _active) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            _offset = averageOffset;
+            [self.delegate netAssociationDidUpdateState:self];
+        });
     }
 }
 
@@ -425,18 +493,24 @@ double ntpDiffSeconds(union ntpTime * start, union ntpTime * stop) {
       fromAddress:(NSData *)address withFilterContext:(id)filterContext {
 //  NTP_Logging(@"didReceiveData - [%@]", [GCDAsyncUdpSocket hostFromAddress:address]);
 
-    [self decodePacket:data];
+    /*┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
+      │  grab the packet arrival time as fast as possible, before computations below ...                 │
+      └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
+    ntpClientRecvTime = ntp_time_now();
+
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        __strong typeof(self) strongSelf = weakSelf;
+        if (strongSelf) {
+            dispatch_async(workingQueue, ^{
+                [strongSelf decodePacket:data];
+            });
+        }
+    });
 }
 
 - (void)udpSocketDidClose:(GCDAsyncUdpSocket *)sock withError:(NSError *)error {
-    NTP_Logging(@"Socket closed : [%@]", _server);
-}
-
-/*┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-  ┃ Make an NSDate from ntpTimestamp ... (via seconds from JAN_1970) ...                             ┃
-  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛*/
-- (NSDate *) dateFromNetworkTime:(union ntpTime *) networkTime {
-    return [NSDate dateWithTimeIntervalSince1970:ntpDiffSeconds(&NTP_1970, networkTime)];
+    NTP_Logging(@"Socket closed : [%@]", _serverIPAddress);
 }
 
 #pragma mark                        P r e t t y P r i n t e r s
@@ -480,67 +554,20 @@ double ntpDiffSeconds(union ntpTime * start, union ntpTime * stop) {
     return prettyString;
 }
 
-- (NSString *) prettyPrintTimers {
+- (NSString *) prettyPrintTimersWithOffset:(double)offset {
     NSMutableString *   prettyString = [NSMutableString stringWithFormat:@"prettyPrintTimers\n\n"];
 
     [prettyString appendFormat:@"time server addr: [%@]\n"
                                 " round trip time: %7.3f (mS)\n"
                                 "    clock offset: %7.3f (mS)\n\n",
-          _server, _roundtrip * 1000.0, _offset * 1000.0];
+          _serverIPAddress, _roundtrip * 1000.0, offset * 1000.0];
 
     return prettyString;
 }
 
 - (NSString *) description {
-    return [NSString stringWithFormat:@"%@ [%@] stratum=%i; offset=%3.1f±%3.1fmS",
-            _trusty ? @"↑" : @"↓", _server, stratum, _offset, _dispersion];
-}
-
-#pragma mark                      N o t i f i c a t i o n • T r a p s
-
-- (void)registerObservations {
-
-/*┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-  ┃ if associations are going to have a life, they have to react to their app being backgrounded.    ┃
-  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛*/
-
-/*┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
-  │ applicationBack -- catch the notification when the application goes into the background          │
-  └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
-	[[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidEnterBackgroundNotification
-													  object:nil queue:nil
-												  usingBlock:^
-	 (NSNotification * note) {
-		 NTP_Logging(@"Application -> Background");
-		 [self finish];
-	 }];
-
-/*┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
-  │ applicationFore -- catch the notification when the application comes out of the background       │
-  └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
-	[[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationWillEnterForegroundNotification
-													  object:nil queue:nil
-												  usingBlock:^
-	 (NSNotification * note) {
-		 NTP_Logging(@"Application -> Foreground");
-		 [self enable];
-	 }];
-
-/*┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-  ┃ if associations are going to have a life, they have to react to midnight and daylight saving.    ┃
-  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛*/
-
-/*┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
-  │ significantTimeChange -- trash the fifo ..                                                       │
-  └──────────────────────────────────────────────────────────────────────────────────────────────────┘*/
-	[[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationSignificantTimeChangeNotification
-													  object:nil queue:nil
-												  usingBlock:^
-	 (NSNotification * note) {
-		 NTP_Logging(@"Application -> SignificantTimeChange");
-		 for (short i = 0; i < 8; i++) fifoQueue[i] = NAN;      // set fifo to all empty
-		 fifoIndex = 0;
-	 }];
+    return [NSString stringWithFormat:@"%@ [%@:%@] stratum=%i; offset=%3.1f±%3.1fmS",
+            _trusty ? @"↑" : @"↓", _pool, _serverIPAddress, stratum, _offset, _dispersion];
 }
 
 @end
