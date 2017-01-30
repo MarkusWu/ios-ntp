@@ -17,7 +17,7 @@
   ╚══════════════════════════════════════════════════════════════════════════════════════════════════╝*/
 
 #import <UIKit/UIKit.h>
-#import "GCDAsyncUdpSocket.h"
+#import <CocoaAsyncSocket/GCDAsyncUdpSocket.h>
 
 @class NetAssociation;
 @protocol NetAssociationDelegate <NSObject>
